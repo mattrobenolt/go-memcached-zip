@@ -4,10 +4,20 @@ import (
 	"fmt"
 	"net"
 	"log"
+	"bytes"
+	"compress/flate"
+	"io/ioutil"
 )
 
 const (
 	ERROR = "ERROR\r\n"
+	SET_CMD = "set %s %s %s %d\r\n%s\r\n"
+	RESULT = "VALUE %s %s %d\r\n%s\r\nEND\r\n"
+)
+
+var (
+	NEWLINE = []byte{'\n'}
+	SPACE = []byte{' '}
 )
 
 func main() {
@@ -28,37 +38,76 @@ func main() {
 }
 
 func handle(local net.Conn) {
-	log.Print("accept")
 	remote, err := net.Dial("tcp", ":11211")
 	if err != nil {
 		fmt.Fprint(local, ERROR)
+		log.Print("Error connecting to remote")
 		return
 	}
-	recv := make([]byte, 10000)
+	recv := make([]byte, 1048576)  // 1MB recv buffer
 	go func() {
 		defer local.Close()
 		for {
+			isGet := false
+
 			// Read in the request
 			n, err := local.Read(recv)
 			if err != nil {
 				fmt.Fprint(local, ERROR)
-				log.Print("derp")
+				log.Print("Error reading from local")
 				return
 			}
-			log.Printf("> %s", recv[0:n])
-			if recv[0] == 's' {  // Check if the first byte is 's' for 'set'
-				log.Print("setting")
+
+			buf := new(bytes.Buffer)
+
+			// log.Printf("> %s", recv[0:n])
+			switch recv[0] {
+			case 's':
+				pieces := bytes.SplitN(recv[4:n], NEWLINE, 2)
+				cmdPieces := bytes.Split(pieces[0], SPACE)
+				value := pieces[1]
+				value = value[:len(value)-2]  // strip off the \r\n
+				// log.Printf("%s", cmd)
+				compressedValue := new(bytes.Buffer)
+				compressor, _ := flate.NewWriter(compressedValue, flate.BestSpeed)
+				compressor.Write(value)
+				compressor.Close()
+				length := int64(compressedValue.Len())
+				fmt.Fprintf(buf, SET_CMD, cmdPieces[0], cmdPieces[1], cmdPieces[2], length, compressedValue)
+			case 'g':
+				isGet = true;
+				fallthrough
+			default:
+				buf.Write(recv[0:n])
 			}
 
 			// Write the request bytes to the remote server
-			fmt.Fprintf(remote, "%s", recv[0:n])
+			buf.WriteTo(remote)
 
 			// Read back response from remote
-			n, _ = remote.Read(recv)
-			log.Printf("< %s", recv[0:n])
+			n, err = remote.Read(recv)
+			if err != nil {
+				fmt.Fprint(local, ERROR)
+				log.Print("Error reading from remote")
+				return
+			}
+
+			buf = new(bytes.Buffer)
+
+			if isGet && recv[0] == 'V' {
+				pieces := bytes.SplitN(recv[6:n], NEWLINE, 2)
+				valuePieces := bytes.Split(pieces[0], SPACE)
+				value := pieces[1]
+				decompressor := flate.NewReader(bytes.NewBuffer(value))
+				decompressedValue, _ := ioutil.ReadAll(decompressor)
+				fmt.Fprintf(buf, RESULT, valuePieces[0], valuePieces[1], len(decompressedValue), decompressedValue)
+			} else {
+				buf.Write(recv[0:n])
+			}
+			// log.Printf("< %s", buf)
 
 			// Write response to local
-			fmt.Fprintf(local, "%s", recv[0:n])
+			buf.WriteTo(local)
 		}
 	}()
 }
